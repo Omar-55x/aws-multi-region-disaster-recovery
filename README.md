@@ -19,7 +19,7 @@ The architecture is split into two diagrams:
 - **Compute:** Provided using **EC2** instances for compute power, **Auto Scaling** for handling traffic changes and spikes, and **ALB** for HTTP/S path-based routing.
 - **Database:** **Aurora Global Database** is configured to provide cross-region database replication. **DynamoDB Global Tables** provide active-active data replication for low-latency reads and writes across the two regions.
 - **Storage:** **S3** stores application files, user-uploaded content, and static assets. **Cross-Region Replication** is configured to allow file accessibility when the primary region is unavailable.
-- **Backup:** **AWS Backup** allows restoring data to an earlier recovery point and adding another recovery source with centralized backup plans for RDS, EC2, and S3.
+- **Backup:** **AWS Backup** allows restoring data to an earlier recovery point and adding another recovery source with centralized backup plans for Aurora databases, EC2, and S3.
 - **Security:** **IAM** is used to manage authentication and access to resources using permissions and different types of policies. Data is encrypted at rest with **KMS** using AWS-managed keys.
 - **Monitoring:** Application metrics and alarms are managed through **CloudWatch** to monitor health of the resources and make sure the application is running smoothly.
 - **Automation:** **EventBridge** and **Lambda** are used to handle the recovery actions that should be taken during a failover.
@@ -54,3 +54,79 @@ Having a look at the four main disaster recovery strategies:
 
 ### Why Warm Standby?
 This application is running production workloads that contains critical user data that needs to be kept safe and available at any time. Keeping that in consideration and for optimizing costs, the optimal solution for this case was pointing towards the Warm Standby DR patten.
+
+# Failover and Recovery Workflow
+Failover and recovery workflow involves multiple steps:  
+
+### 1. Failure Detection
+- Route 53 continues to route traffic to the primary region's ALB, but the requests fails to reach the endpoint.
+- After failing a treshold of checks, Route 53 marks it unhealthy and stops routing traffic to it.
+- CloudWatch receives the health check metrics and triggers an alarm.
+- When the alarm enters the `ALARM` state, an EventBridge rule detects the state change and triggers the recovery Lambda function.
+
+### 2. DNS Failover
+- Route 53 uses a Failover routing policy with two records:
+  1. Primary record pointing to the Application Load Balancer in `us-east-1`.
+  2. Secondary record pointing to the Application Load Balancer in `eu-west-1`.
+- After the first record changes changes state to unhealthy, Route 53 stops routing traffic to the primary record and starts routing to the secondary record.
+- A DNS TTL configured at **60 seconds** will then cache the new route, so for existing caches, traffic may not switch immediately.
+
+### 3. Database Promotion
+- The recovery Lambda function starts the database recovery process.  
+  
+- For Aurora Global Database:
+  - The secondary aurora cluster is read-only by default.
+  - During a regional failure, the second cluster is promoted to become the primary cluster allowing write operations.
+  - Applications in the secondary region can then perform operations on the newly promoted cluster.
+
+- For DynamoDB Global Tables:
+  - Data was already actively replicated to the secondary region.
+  - The secondary region can continue to accept reads and writes to its replica.
+
+### 4. Application Scaling
+- Since we are using the Warm Standby DR strategy, the secondary region already has minimal running instances.
+- The recovery Lambda function performs the following scaling actions for the Auto Scaling Group in `eu-west-1`:
+    - Increases the desired instance capacity.
+    - Launches more EC2 instances.
+- The Application Load Balancer performs health checks on the new instances.
+- If healthy, the instances become available to receive traffic.
+  
+### 5. Recovery Monitoring and Failback
+- After failover, `eu-west-1` becomes the active region, while `us-east-1` remains unavailable until restored.
+- CloudWatch continues to monitor the secondary region, and AWS Backup provides additional recovery options if data restoration becomes necessary.
+- Once the primary region `us-east-1` is recovered, a failback process can begin following these steps:
+    1. Restore and verify the infrastructure in `us-east-1`.
+    2. Synchronize data from the active secondary region.
+    3. Switch Aurora Global Database primary cluster to make `us-east-1` the writer cluster again.
+    4. Verify that the application is operating properly in the primary region.
+    5. Modify Route 53 to route to the primary region
+    6. Scale down the secondary region to the Warm Standby capacity.
+
+# Failover Considerations
+Something to consider about this failover strategy is that Route 53 DNS failover happens independently of Lambda's recovery actions. This adds a possibility that the users might reach the secondary region before:
+- Aurora has been promoted.
+- EC2 capacity has been increased.
+- The application is ready to accept requests.
+
+At the moment, this is handled by the application through retries until Auroa promotion and scaling is completed.
+
+# Data Protection and Backup Strategy
+The strategy consists of combining multiple services and layers of data protection as follows:
+
+**1. Aurora Global Database replication**
+- Aurora Global Databases allows spanning multiple regions providing asynchronous data replication.
+- The primary cluster in `us-east-1` handles both reads and writes, while the secondary region can serve low-latency reads for global users.
+- In a disaster, the secondary region can be promoted to primary in **under 1 minute** for RTO < 1 minute and RPO < 1 second.
+
+**2. S3 Cross-Region Replication**
+- Cross-Region Replication allows S3 to replicate objects from the source S3 bucket in `us-east-1` to the bucket in `eu-west-1` for usage if the primary region becomes unavailable.
+
+**3. DynamoDB Global Tables**
+- Global Tables allows multi-region, active-active replication for DynamoDB tables.
+- This makes any updates made in one region be replicated to the other one automatically, providing high availability.
+
+**4. AWS Backup plans and cross-region backup copies**
+- As another layer of data protection, AWS Backup creates scheduled backups of Aurora databases, EC2, and S3.
+- Backup plans define backup schedules, retention period, and cross-region copy rules.
+- Recovery points are stored in a primary backup vault in `us-east-1`, with copies made in a secondary backup vault in `eu-west-1`.
+- This allows the resouces to be restored in a specific point in time in case of a disaster or if data is accidentally deleted.
