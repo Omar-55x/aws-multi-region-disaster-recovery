@@ -1,3 +1,25 @@
+## Table of content
+- [Solution Overview](#solution-overview)
+- [Architecture Diagrams](#architecture-diagrams)
+  - [Main Architecture](#main-architecture)
+  - [Failover Automation Flow](#failover-automation-flow)
+- [Architecture Componenets](#architecture-componenets)
+- [Disaster Recovery Strategies](#disaster-recovery-strategies)
+    - [RTO/RPO and Cost Comparison:](#rtorpo-and-cost-comparison)
+    - [Why Warm Standby?](#why-warm-standby)
+- [Failover and Recovery Workflow](#failover-and-recovery-workflow)
+    - [1. Failure Detection](#1-failure-detection)
+    - [2. DNS Failover](#2-dns-failover)
+    - [3. Database Promotion](#3-database-promotion)
+    - [4. Application Scaling](#4-application-scaling)
+    - [5. Recovery Monitoring and Failback](#5-recovery-monitoring-and-failback)
+- [Failover Considerations](#failover-considerations)
+- [Data Protection and Backup Strategy](#data-protection-and-backup-strategy)
+- [Infrastructure Deployment](#infrastructure-deployment)
+- [Security Considerations](#security-considerations)
+- [Cost Considerations](#cost-considerations)
+- [Limitations](#limitations)
+
 # Solution Overview
 The solution demonstrates a multi-region disaster recovery strategy for a web application with Route 53 failover. A primary region (us-east-1) runs the primary stack. A secondary region (eu-west-1) maintains warm standby resources. Route 53 health checks detect primary region failure and automatically failover DNS. Failover actions automation is implemented by Lambda functions that are triggered by EventBridge on failover. Backups provide an additional layer of data protection against scenarios that replication cannot handle. Primary region's infrastructure will be restored and data will be synchronized to failback to the primary region.
 
@@ -130,3 +152,36 @@ The strategy consists of combining multiple services and layers of data protecti
 - Backup plans define backup schedules, retention period, and cross-region copy rules.
 - Recovery points are stored in a primary backup vault in `us-east-1`, with copies made in a secondary backup vault in `eu-west-1`.
 - This allows the resouces to be restored in a specific point in time in case of a disaster or if data is accidentally deleted.
+
+# Infrastructure Deployment
+For consistency, deployment of the infrastructure is done using **CloudFormation** for IaC which will enable:
+- Repeatable deployments
+- Version control for infrastructure changes
+- Automated cleanup
+
+By leveraging the CloudFormation StackSets feature, deployments across multiple accounts and regions will be enabled. This will extend the stacks to deploy byond just the primary region from a single operation. For implemeting region-specifc configurations, mappings and pseudo parameters are used.
+
+# Security Considerations
+For security assurance, multiple considerations are taken:
+
+- **IAM roles and least privilege:** User permissions are managed through IAM roles for granting temporary permissions depending on the use case. The principle of Least Privilege is put into consideration for granting only the necessary permission for the user to perform his specific tasks and nothing more.  
+
+- **Security Groups:** Access to instances is limited by leveraging security groups at the instance level. This adds traffic filtering and blocks unwanted and suspicous traffic from accessing the instances.
+
+- **KMS encryption:** Data at AWS resources is encrypted using Managed KMS Keys. Keys are automatically rotated every year to make sure that a single key is used only for a specific period of time, reducing the amount of data exposed if a key is stolen.
+
+- **Backup vault protection:** The backup vault protection enforces Write-Only-Read-Many model to prevent users, including the root account, from deleting or modifying recovery points before their retention period ends.
+
+# Cost Considerations
+Multiple factors of cost should also be considered when implementing this solution:
+- **EC2 standby costs:** The secondary region runs scaled-down but functioncal EC2 instances. These instances incur compute costs. Costs can be reduced by using smaller instance types, Savings Plans, or Reserved Instances for baseline capacity.
+- **Aurora Global Database costs:** The secondary region's cluster charges for instances, storage, and inter-region data transfers per GB.
+- **S3 replication and storage costs:** Cross-Region Replication incurs storage costs in the secondary region, in addition to the requests to replicate objects in the bucket. Transfer costs are charged for inter-region transfers.
+- **Backup storage costs:** Backup snapshots and cross-region copies incur costs per GB/month.
+- **Monitoring and automation costs:** You are charged for CloudWatch metrics, alarms, Route 53 health checks, EventBridge, and Lambda for failover automation.
+
+# Limitations
+- **DNS propagation and caching:** Even with 60 seconds TTL, some clients cache records longer, so not all users will switch over immediately.
+- **Asynchronous replication:** Aurora Global Database and S3 CRR replicate asynchronously, so the standby may lag behind the primary.
+- **Potential data loss:** Because of the lag, there is a possibility of losing some data if the primary fails before the replication completes.
+- **Recovery automation limitations:** Automation scripts run by Lambda depend on APIs and credentials that must be available during the failover. Scaling up takes time for instances to launch, warm up, health checks, etc., so RTO is in minutes not zero.
